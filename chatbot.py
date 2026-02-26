@@ -1,10 +1,58 @@
 import os
 import asyncio
-from database import get_user_context
+from database import get_user_context, save_user_fact
 from openai import AsyncOpenAI, APIError, RateLimitError, APITimeoutError
 from dotenv import load_dotenv
+import json
+from vector_memory import save_episode, recall_past_episodes
 
 load_dotenv()
+
+async def extract_and_save_facts(username, user_input):
+    """
+    Analyses the user's input to see if they shared any permanent traits.
+    Saves them to the database if found.
+    """
+    extraction_prompt = [
+        {
+            "role": "system", 
+            "content": (
+                "You are an information extraction bot. Monitor the user's message for "
+                "permanent facts about their learning style, goals, or weaknesses. "
+                "Ignore temporary things like 'I am tired.' "
+                "Output ONLY a JSON object with a 'facts' key containing a list. "
+                "Example: {'facts': [{'key': 'style', 'value': 'visual'}]}"
+                "If no facts are found, output an empty list: []"
+            )
+        },
+        {"role": "user", "content": user_input}
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model="google/gemini-2.0-flash-exp:free", # Use a fast/free model
+            messages=extraction_prompt,
+            response_format={ "type": "json_object" } # Ensures we get clean JSON
+        )
+        
+        # Parse the JSON response
+        raw_content = response.choices[0].message.content
+        data = json.loads(raw_content)
+        
+        # Handle if data is a list directly or a dict with a 'facts' key
+        facts = data.get("facts", []) if isinstance(data, dict) else data
+
+        for fact in facts:
+            key = fact.get("key")
+            value = fact.get("value")
+            if key and value:
+                # Use your existing DB function
+                save_user_fact(username, key, value)
+                print(f"--- [Memory Log] Saved: {key} = {value} ---")
+
+    except Exception as e:
+        # We fail silently here so the user's chat isn't interrupted
+        pass
 
 BASE_INSTRUCTIONS = (
     "You are a Socratic Study Tutor. Your goal is to help students learn "
@@ -123,35 +171,46 @@ async def main():
         if not user_input.strip():
             print("Please enter a question or statement to continue the session.\n")
             continue
-        # Append user message to session history
+        # 1. APPEND USER MESSAGE
         session_history.append({"role": "user", "content": user_input})
         
-        # Check if we need to summarize (using the personalized prompt as the anchor)
-        if len(session_history) > MAX_HISTORY_MESSAGES + 1:  # +1 for the system prompt
-            print("--- System: Consolidating memory to stay within limits ---")
-            
-            # Summarize everything EXCEPT the System Prompt and the very last question
+        # 2. RETRIEVE EPISODIC MEMORY (Optional Injection)
+        past_memories = recall_past_episodes(user_input, n_results=2)
+        
+        # We create a temporary copy of history to send to the API
+        # This keeps the 'past memories' from cluttering future turns
+        temp_history = list(session_history) 
+        
+        if past_memories:
+            memory_context = "\n[RELEVANT PAST LESSONS]\n" + "\n---\n".join(past_memories)
+            # Insert memory context right after the first system prompt
+            temp_history.insert(1, {"role": "system", "content": memory_context})
+
+        # 3. SUMMARIZATION CHECK
+        if len(session_history) > MAX_HISTORY_MESSAGES + 1:
+            print("--- System: Consolidating memory ---")
             summary = await summarize_history(session_history[1:-1]) 
-            
-            # Rebuild history: [System] + [Summary] + [Current Question]
             session_history = [
                 session_history[0],
-                {"role": "assistant", "content": f"Summary of our progress so far: {summary}"},
+                {"role": "assistant", "content": f"Summary: {summary}"},
                 session_history[-1]
             ]
+            # If we summarized, our temp_history is now outdated, so we refresh it
+            temp_history = [session_history[0], {"role": "system", "content": memory_context if past_memories else ""}] + session_history[1:]
             
         print("Tutor is thinking...\n")
-        tutor_response = await get_tutor_response(session_history)
+        # We send temp_history (with memories) but keep session_history clean
+        tutor_response = await get_tutor_response(temp_history)
         
-        
-        
-        if tutor_response is None:
-            # Remove the last user message so the failed turn isn't stored
-            session_history.pop()
-            continue
-        # Add AI's response to memory so context is preserved
-        session_history.append({"role": "assistant", "content": tutor_response})
-        print(f"Tutor: {tutor_response}\n")
+        if tutor_response:
+            print(f"Tutor: {tutor_response}\n")
+            session_history.append({"role": "assistant", "content": tutor_response})
+            
+            # Save the new episode
+            save_episode(f"{username}_session", user_input, tutor_response)
+
+            # Background Secretary
+            asyncio.create_task(extract_and_save_facts(username, user_input))
  
  
 if __name__ == "__main__":
