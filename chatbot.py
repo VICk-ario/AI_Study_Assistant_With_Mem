@@ -7,6 +7,34 @@ import json
 from vector_memory import save_episode, recall_past_episodes
 
 load_dotenv()
+async def extract_keywords_and_subject(user_input :str) -> dict:
+    """
+    The 'Hybrid' part: Extracts keywords for better search 
+    and detects the subject for metadata filtering.
+    """
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Analyze the user input. Output a JSON object with: "
+                "1. 'subject' (one word, e.g., 'economics', 'math', 'history', or 'general') "
+                "2. 'keywords' (a list of 3-4 key technical terms or dates). "
+                "Example: {'subject': 'economics', 'keywords': ['inflation', '1970s', 'purchasing power']}"
+            )
+        },
+        {"role": "user", "content": user_input}
+    ]
+    
+    try:
+        response = await client.chat.completions.create(
+            model="google/gemini-2.0-flash-exp:free",
+            messages=prompt,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content)
+        return data
+    except:
+        return {"subject": "general", "keywords": []}
 
 async def extract_and_save_facts(username, user_input):
     """
@@ -149,15 +177,10 @@ async def summarize_history(history):
 #the memory and loop: Keeping the session alive
 async def main():
     if not os.environ.get("OPENAI_API_KEY"):
-        print(
-            "[Warning] OPENAI_API_KEY is not set. "
-            "Add it to your environment or a .env file.\n"
-            )
-    #initialize session state with system prompt
+        print("[Warning] OPENAI_API_KEY is not set.")
+        
     session_history = [PERSONALIZED_SYSTEM_MESSAGE]
-    
     print(f"---Socratic Tutor Initialized for {username}---")
-    print("Type 'exit' to end the session.\n")
     
     loop = asyncio.get_event_loop()
     
@@ -165,28 +188,36 @@ async def main():
         user_input = await loop.run_in_executor(None, input, "You: ")
         
         if user_input.strip().lower() == "exit":
-            print("Ending session. Goodbye!")
             break
         
         if not user_input.strip():
-            print("Please enter a question or statement to continue the session.\n")
             continue
-        # 1. APPEND USER MESSAGE
+
+        # 1. ADD USER MESSAGE TO REAL HISTORY
         session_history.append({"role": "user", "content": user_input})
         
-        # 2. RETRIEVE EPISODIC MEMORY (Optional Injection)
-        past_memories = recall_past_episodes(user_input, n_results=2)
+        # 2. ANALYSIS PHASE (Hybrid Search Prep)
+        analysis = await extract_keywords_and_subject(user_input)
+        current_subject = analysis.get("subject", "general")
+        keywords = ", ".join(analysis.get("keywords", []))
+
+        # 3. RETRIEVAL PHASE (The Vector Search)
+        hybrid_query = f"Keywords: {keywords}. Context: {user_input}"
+        past_memories = recall_past_episodes(
+            query=hybrid_query, 
+            username=username, 
+            subject=current_subject
+        )
         
-        # We create a temporary copy of history to send to the API
-        # This keeps the 'past memories' from cluttering future turns
-        temp_history = list(session_history) 
-        
+        # 4. INJECTION PHASE (Creating the 'Fake' History for the LLM)
+        temp_history = list(session_history)
+        memory_context = ""
         if past_memories:
-            memory_context = "\n[RELEVANT PAST LESSONS]\n" + "\n---\n".join(past_memories)
-            # Insert memory context right after the first system prompt
+            memory_context = f"\n[PAST LESSONS ON {current_subject.upper()}]\n" + "\n---\n".join(past_memories)
+            # Inject memory context right after the system prompt
             temp_history.insert(1, {"role": "system", "content": memory_context})
 
-        # 3. SUMMARIZATION CHECK
+        # 5. SUMMARIZATION PHASE (Keeping history lean)
         if len(session_history) > MAX_HISTORY_MESSAGES + 1:
             print("--- System: Consolidating memory ---")
             summary = await summarize_history(session_history[1:-1]) 
@@ -195,23 +226,22 @@ async def main():
                 {"role": "assistant", "content": f"Summary: {summary}"},
                 session_history[-1]
             ]
-            # If we summarized, our temp_history is now outdated, so we refresh it
-            temp_history = [session_history[0], {"role": "system", "content": memory_context if past_memories else ""}] + session_history[1:]
-            
+            # Refresh temp_history to reflect the new summary while keeping the past memory injection
+            temp_history = [session_history[0]]
+            if memory_context:
+                temp_history.append({"role": "system", "content": memory_context})
+            temp_history.extend(session_history[1:])
+
+        # 6. GENERATION PHASE
         print("Tutor is thinking...\n")
-        # We send temp_history (with memories) but keep session_history clean
         tutor_response = await get_tutor_response(temp_history)
         
         if tutor_response:
             print(f"Tutor: {tutor_response}\n")
             session_history.append({"role": "assistant", "content": tutor_response})
             
-            # Save the new episode
-            save_episode(f"{username}_session", user_input, tutor_response)
-
-            # Background Secretary
+            # 7. PERSISTENCE PHASE (Saving for the future)
+            save_episode(username, current_subject, user_input, tutor_response)
             asyncio.create_task(extract_and_save_facts(username, user_input))
- 
- 
 if __name__ == "__main__":
     asyncio.run(main())

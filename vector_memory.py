@@ -9,37 +9,54 @@ client = chromadb.PersistentClient(path="./chroma_storage")
 #get or create a "collection"(This is like a table in a traditional database) to store our memories
 collection = client.get_or_create_collection(name="episodic_memories")
 
-def save_episode(session_id:str, user_input:str, tutor_response:str):
+def save_episode(username:str,subject:str, user_input:str, tutor_response:str):
     """
     Saves a learning episode to the ChromaDB collection.
-    Each episode includes the session ID, user input, tutor response, and an embedding for semantic search.
+    Each episode includes the session ID , subject, user input, tutor response, and an embedding for semantic search.
     """
+    #Timestamp. This is vital for "weeks ago" recall because you can tell the AI when the memory happened.
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M") 
     # We combine the exchange into one readable "memory" string
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     memory_text = f"[{timestamp}] Student asked: {user_input}\nTutor replied: {tutor_response}"
     #We need a unique ID for every memory. We can use the session_id + the total count
     memory_count = collection.count()
-    memory_id = f"{session_id}_{memory_count + 1}"
-    #Add the memory to the collection with its embedding
-    #Chroma will automatically convert the documents  into math vectors
+    memory_id = f"{username}_{datetime.datetime.now().timestamp()}"
+
+    # We add metadata keys that we can filter on later
     collection.add(
-        ids=[memory_id],
         documents=[memory_text],
-        metadatas=[{"session_id": session_id, "type": "dialogue"}]
+        metadatas=[{
+            "username": username, 
+            "subject": subject, 
+            "date": timestamp
+        }],
+        ids=[memory_id]
     )
     print(f"[Vector DB] Saved Episode : {memory_id}")
     
-def recall_past_episodes(current_query: str, n_results: int = 2) -> list[str]:
+def recall_past_episodes(current_query: str, username: str, subject: str = None, n_results: int = 2) -> list[str]:
     """Searches the database for past exchanges similar to the current query."""
-    
     # If the database is empty, return nothing
     if collection.count() == 0:
         return []
+    # Construct the filter
+    # We always filter by username so students don't see each other's memories
+    where_filter = {"username": username}
+    
+    # If a specific subject is provided, we use a 'and' logic
+    if subject:
+        where_filter = {
+            "$and": [
+                {"username": {"$eq": username}},
+                {"subject": {"$eq": subject}}
+            ]
+        }
 
     # Search the vector database
     results = collection.query(
         query_texts=[current_query],
-        n_results=n_results
+        n_results=n_results,
+        where=where_filter
     )
     
     # Extract the actual text documents from the results
