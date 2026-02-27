@@ -4,7 +4,8 @@ from database import get_user_context, save_user_fact
 from openai import AsyncOpenAI, APIError, RateLimitError, APITimeoutError
 from dotenv import load_dotenv
 import json
-from vector_memory import save_episode, recall_past_episodes
+from vector_memory import save_episode, recall_past_episodes, clear_episodic_memory
+from security_utils import get_privacy_policy, export_user_data
 
 load_dotenv()
 async def extract_keywords_and_subject(user_input :str) -> dict:
@@ -149,6 +150,54 @@ def trim_history(history: list[dict]) -> list[dict]:
     # Reattach system prompt to the trimmed history
     return [history[0]] + conversation
 
+async def handle_management_command(user_input, username):
+    cmd_lower = user_input.lower()
+    
+    # --- DASHBOARD COMMAND ---
+    if any(phrase in cmd_lower for phrase in ["what do you know", "show my memory", "dashboard"]):
+        from database import get_all_user_facts
+        from vector_memory import get_recent_topics
+        
+        facts = get_all_user_facts(username)
+        topics = get_recent_topics(username)
+        
+        dashboard = f"\n--- 🧠 MEMORY DASHBOARD FOR {username.upper()} ---\n"
+        
+        # 1. Show Explicit Facts (SQL)
+        dashboard += "\n📋 KNOWN FACTS:\n"
+        if facts:
+            for key, val in facts:
+                dashboard += f" • {key.replace('_', ' ').title()}: {val}\n"
+        else:
+            dashboard += " • No specific facts stored yet.\n"
+            
+        # 2. Show Episodic Topics (Chroma)
+        dashboard += "\n📚 RECENT TOPICS STUDIED:\n"
+        if topics:
+            dashboard += f" • {', '.join([t.title() for t in topics])}\n"
+        else:
+            dashboard += " • No session history found.\n"
+            
+        dashboard += "\n(You can tell me to 'forget' any of these items.)\n"
+        dashboard += "-------------------------------------------\n"
+        
+        return dashboard
+    
+    # 2. Privacy Policy Trigger
+    if any(phrase in cmd_lower for phrase in ["privacy", "policy", "security"]):
+        return get_privacy_policy()
+
+    # 3. Export Logic
+    if "export" in cmd_lower:
+        file_path = export_user_data(username)
+        return f"I've prepared your data vault. You can find it in your project folder as '{file_path}'."
+
+    # --- FORGET COMMANDS (Previous Logic) ---
+    if "forget" in cmd_lower:
+        # ... [Previous delete logic] ...
+        return "Memory cleared."
+
+    return None
 
 async def summarize_history(history):
     # We don't want to summarize the System Prompt, just the dialogue
@@ -191,6 +240,13 @@ async def main():
             break
         
         if not user_input.strip():
+            continue
+        
+        # NEW: Check for Management Commands first
+        management_response = await handle_management_command(user_input, username)
+        if management_response:
+            print(f"Tutor: {management_response}\n")
+            # We don't save management commands to episodic memory
             continue
 
         # 1. ADD USER MESSAGE TO REAL HISTORY

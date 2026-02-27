@@ -1,4 +1,6 @@
+import json
 import sqlite3
+from security_utils import encrypt_text, decrypt_text
 
 DB_NAME = 'tutor_database.db'
 
@@ -34,33 +36,30 @@ def init_db():
     print("Database initialized and tables created .")
     
 def save_user_fact(username, key, value):
-    """Saves a user fact (like learning style, weaknesses, goals) to the database."""
+    """Encrypts and saves a user fact to the database."""
+    encrypted_value = encrypt_text(value) # Scramble the data first
+    
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # Get user_id from username
+    # 1. Ensure user exists and get ID
+    c.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
     c.execute("SELECT id FROM users WHERE username = ?", (username,))
-    user = c.fetchone()
+    user_id = c.fetchone()[0]
     
-    if not user:
-        # If user doesn't exist, create them
-        c.execute("INSERT INTO users (username) VALUES (?)", (username,))
-        user_id = c.lastrowid
-    else:
-        user_id = user[0]
-    
-    # Save or update the user fact
+    # 2. Save or update the encrypted fact
     c.execute('''
         INSERT INTO user_facts (user_id, fact_key, fact_value) 
         VALUES (?, ?, ?)
         ON CONFLICT(user_id, fact_key) DO UPDATE SET fact_value=excluded.fact_value
-    ''', (user_id, key, value))
+    ''', (user_id, key, encrypted_value)) # Use encrypted_value here!
     
     conn.commit()
     conn.close()
+    print(f"--- [Security] Encrypted fact saved for {username} ---")
     
 def get_user_context(username):
-    """Retrieves all facts about a user and formats them for the system prompt."""
+    """Retrieves, decrypts, and formats user facts for the system prompt."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
@@ -68,7 +67,6 @@ def get_user_context(username):
                JOIN users ON user_facts.user_id = users.id
                WHERE users.username = ?'''
     
-    # Get user_id from username
     c.execute(query, (username,))
     facts = c.fetchall()
     conn.close()
@@ -76,10 +74,45 @@ def get_user_context(username):
     if not facts:
         return "New student with no recorded preferences."
     
-    # Format facts into a string for the LLM
-    context_str = "Known information about this student:\n" + "\n".join([f"{key}: {value}" for key, value in facts])
-    
+    # 3. Decrypt the facts for the AI to read
+    decrypted_lines = []
+    for key, encrypted_val in facts:
+        try:
+            plain_val = decrypt_text(encrypted_val)
+            decrypted_lines.append(f"{key}: {plain_val}")
+        except Exception:
+            # Fallback in case there's old, unencrypted data in the DB
+            decrypted_lines.append(f"{key}: {encrypted_val}")
+
+    context_str = "Known information about this student:\n" + "\n".join(decrypted_lines)
     return context_str
+
+def delete_user_fact(username, key):
+    """Deletes a specific fact about a user from the SQL database."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Assuming your table has a 'username' or you've linked it via user_id
+    c.execute('''
+        DELETE FROM user_facts 
+        WHERE user_id = (SELECT id FROM users WHERE username = ?) 
+        AND fact_key = ?
+    ''', (username, key))
+    conn.commit()
+    conn.close()
+    print(f"[SQL DB] Fact '{key}' deleted for {username}.")
+
+def get_all_user_facts(username):
+    """Retrieves all key-value pairs for a specific user."""
+    import sqlite3
+    conn = sqlite3.connect('tutor_memory.db')
+    c = conn.cursor()
+    c.execute('''
+        SELECT fact_key, fact_value FROM user_facts 
+        WHERE user_id = (SELECT id FROM users WHERE username = ?)
+    ''', (username,))
+    facts = c.fetchall()
+    conn.close()
+    return facts # Returns a list of tuples: [('learning_style', 'visual'), ...]
 
 if __name__ == "__main__":
     init_db()

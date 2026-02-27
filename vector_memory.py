@@ -1,6 +1,8 @@
 import chromadb
 from chromadb.utils import embedding_functions
 import datetime
+import json
+from security_utils import encrypt_text, decrypt_text
 
 #initialize the persistent ChromaDB client
 #This creates a folder called 'chroma_storage ' in your directory to save memories forever
@@ -8,60 +10,124 @@ client = chromadb.PersistentClient(path="./chroma_storage")
 
 #get or create a "collection"(This is like a table in a traditional database) to store our memories
 collection = client.get_or_create_collection(name="episodic_memories")
+# We need to manually call the embedding function so we can embed PLAIN text 
+# but store ENCRYPTED text.
+default_ef = embedding_functions.DefaultEmbeddingFunction()
 
-def save_episode(username:str,subject:str, user_input:str, tutor_response:str):
-    """
-    Saves a learning episode to the ChromaDB collection.
-    Each episode includes the session ID , subject, user input, tutor response, and an embedding for semantic search.
-    """
-    #Timestamp. This is vital for "weeks ago" recall because you can tell the AI when the memory happened.
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M") 
-    # We combine the exchange into one readable "memory" string
-    memory_text = f"[{timestamp}] Student asked: {user_input}\nTutor replied: {tutor_response}"
-    #We need a unique ID for every memory. We can use the session_id + the total count
-    memory_count = collection.count()
+def save_episode(username, subject, user_input, tutor_response):
+    """Embeds plain text but stores encrypted text in ChromaDB."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    plain_text = f"[{timestamp}] Subject: {subject}\nStudent: {user_input}\nTutor: {tutor_response}"
+    
+    # 1. Generate the embedding from the READABLE text
+    # This ensures the 'coordinates' in the database are correct.
+    embedding = default_ef([plain_text])[0]
+    
+    # 2. Scramble the text for storage
+    encrypted_doc = encrypt_text(plain_text)
+    
     memory_id = f"{username}_{datetime.datetime.now().timestamp()}"
 
-    # We add metadata keys that we can filter on later
     collection.add(
-        documents=[memory_text],
-        metadatas=[{
-            "username": username, 
-            "subject": subject, 
-            "date": timestamp
-        }],
+        documents=[encrypted_doc], # Scrambled text goes to disk
+        embeddings=[embedding],    # Clean math for searching
+        metadatas=[{"username": username, "subject": subject.lower()}],
         ids=[memory_id]
     )
-    print(f"[Vector DB] Saved Episode : {memory_id}")
+    print(f"--- [Security] Encrypted episode saved for {username} ---")
     
-def recall_past_episodes(current_query: str, username: str, subject: str = None, n_results: int = 2) -> list[str]:
-    """Searches the database for past exchanges similar to the current query."""
-    # If the database is empty, return nothing
+def recall_past_episodes(query, username, subject=None, n_results=2):
+    """Retrieves and decrypts past memories."""
     if collection.count() == 0:
         return []
-    # Construct the filter
-    # We always filter by username so students don't see each other's memories
-    where_filter = {"username": username}
-    
-    # If a specific subject is provided, we use a 'and' logic
-    if subject:
-        where_filter = {
-            "$and": [
-                {"username": {"$eq": username}},
-                {"subject": {"$eq": subject}}
-            ]
-        }
 
-    # Search the vector database
+    where_filter = {"username": username}
+    if subject and subject.lower() != "general":
+        where_filter = {"$and": [{"username": {"$eq": username}}, {"subject": {"$eq": subject.lower()}}]}
+
+    # Chroma will automatically embed your 'query' text using the same model
     results = collection.query(
-        query_texts=[current_query],
+        query_texts=[query],
         n_results=n_results,
         where=where_filter
     )
     
-    # Extract the actual text documents from the results
-    retrieved_memories = results['documents'][0]
-    return retrieved_memories
+    encrypted_docs = results['documents'][0]
+    
+    # 3. Decrypt the results so the AI can read them
+    decrypted_docs = []
+    for doc in encrypted_docs:
+        try:
+            decrypted_docs.append(decrypt_text(doc))
+        except Exception:
+            # Fallback for old unencrypted data
+            decrypted_docs.append(doc)
+            
+    return decrypted_docs
+
+def clear_episodic_memory(username, subject=None):
+    """Deletes episodic memories for a user. Optionally filters by subject."""
+    if subject:
+        # Delete only memories for a specific subject
+        collection.delete(
+            where={
+                "$and": [
+                    {"username": {"$eq": username}},
+                    {"subject": {"$eq": subject.lower()}}
+                ]
+            }
+        )
+        print(f"[Vector DB] All {subject} memories cleared for {username}.")
+    else:
+        # Delete EVERYTHING for this user
+        collection.delete(where={"username": username})
+        print(f"[Vector DB] All memories wiped for {username}.")
+        
+def get_recent_topics(username):
+    """Retrieves a unique list of subjects the user has studied."""
+    # We query the most recent 10 entries for this user
+    results = collection.get(
+        where={"username": username},
+        limit=10,
+        include=["metadatas"]
+    )
+    
+    if not results['metadatas']:
+        return []
+
+    # Extract unique subjects from metadata
+    subjects = {m['subject'] for m in results['metadatas'] if 'subject' in m}
+    return list(subjects)
+
+
+def export_user_data(username):
+    """Gathers all SQL and Vector data and saves it to a JSON file."""
+    # We import this here to avoid circular imports if database.py 
+    # already imports vector_memory.py
+    from database import get_all_user_facts
+    
+    # 1. Get SQL Facts (Semantic Memory)
+    facts = get_all_user_facts(username)
+    
+    # 2. Get all Chroma memories (Episodic Memory)
+    # This assumes 'collection' is defined globally in this file
+    memories = collection.get(where={"username": username})
+    
+    data_dump = {
+        "user": username,
+        "exported_at": str(datetime.datetime.now()),
+        "explicit_facts": {k: v for k, v in facts},
+        "conversational_history": memories['documents']
+    }
+    
+    file_name = f"{username}_data_export.json"
+    
+    # Specify utf-8 encoding to prevent crashes on special characters
+    with open(file_name, "w", encoding='utf-8') as f:
+        json.dump(data_dump, f, indent=4, ensure_ascii=False)
+    
+    print(f"--- [Privacy] Data successfully exported to {file_name} ---")
+    return file_name
 
 # --- TEST BLOCK ---
 if __name__ == "__main__":
