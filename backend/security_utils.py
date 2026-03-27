@@ -46,3 +46,30 @@ def get_privacy_policy():
    • Portability: Type 'export' to download your entire data vault as a JSON file.
 --------------------------------------------
     """
+import json
+import datetime
+
+def export_user_data(username):
+    """Gathers all SQL and Vector data and saves it to a JSON file."""
+    from database import get_all_user_facts
+    # Use a local import for vector_memory to avoid circular import errors
+    from backend.vector_memory import collection 
+    
+    # 1. Get SQL Facts
+    facts = get_all_user_facts(username)
+    
+    # 2. Get all Chroma memories
+    memories = collection.get(where={"username": username})
+    
+    data_dump = {
+        "user": username,
+        "exported_at": str(datetime.datetime.now()),
+        "explicit_facts": {k: v for k, v in facts},
+        "conversational_history": memories['documents']
+    }
+    
+    file_name = f"{username}_data_export.json"
+    with open(file_name, "w", encoding='utf-8') as f:
+        json.dump(data_dump, f, indent=4, ensure_ascii=False)
+    
+    return file_name

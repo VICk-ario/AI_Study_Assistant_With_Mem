@@ -2,3 +2,7 @@
 virtual_env/
 __pycache__/
 cryptography-key.py
+google_client_secret.json
+firebase_key.json
+node_modules/
+.env.local

@@ -12,7 +12,9 @@ def init_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL
+            username TEXT UNIQUE NOT NULL,
+            email TEXT,
+            firebase_uid TEXT UNIQUE
         ) 
         ''')
     
@@ -24,6 +26,7 @@ def init_db():
             fact_key TEXT ,
             fact_value TEXT ,
             FOREIGN KEY (user_id) REFERENCES users(id)
+            UNIQUE(user_id, fact_key) -- THIS IS CRITICAL
             
         )
             
@@ -34,6 +37,26 @@ def init_db():
     conn.commit()
     conn.close()
     print("Database initialized and tables created .")
+    
+def get_or_create_user(firebase_uid, email):
+    """Links Firebase Identity to our Local SQL Database."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Check if user exists
+    c.execute("SELECT id FROM users WHERE firebase_uid = ?", (firebase_uid,))
+    user = c.fetchone()
+    
+    if not user:
+        # Create new local user mapped to Firebase UID
+        c.execute("INSERT INTO users (firebase_uid, email, username) VALUES (?, ?, ?)", (firebase_uid, email, email))
+        conn.commit()
+        user_id = c.lastrowid
+    else:
+        user_id = user[0]
+        
+    conn.close()
+    return user_id
     
 def save_user_fact(username, key, value):
     """Encrypts and saves a user fact to the database."""
@@ -103,8 +126,7 @@ def delete_user_fact(username, key):
 
 def get_all_user_facts(username):
     """Retrieves all key-value pairs for a specific user."""
-    import sqlite3
-    conn = sqlite3.connect('tutor_memory.db')
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''
         SELECT fact_key, fact_value FROM user_facts 
