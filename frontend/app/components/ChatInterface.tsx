@@ -8,36 +8,49 @@ export default function ChatInterface({ userId }: { userId: string }) {
   const [isLoading, setIsLoading] = useState(false);
 
   const sendMessage = async () => {
-    if (!message.trim()) return;
-    setIsLoading(true);
+  if (!message.trim()) return;
+  setIsLoading(true);
 
-    // 1. Add your message to the screen immediately
-    const userMessage = { role: "user", content: message };
-    setChatHistory((prev) => [...prev, userMessage]);
-    
-    try {
-      // 2. Send the message to your FastAPI backend
-      const response = await fetch("http://localhost:8000/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-            message: message, 
-            user_id: userId 
-        }),
-      });
+  const userMsg = { role: "user", content: message };
+  setChatHistory((prev) => [...prev, userMsg]);
+  setMessage("");
 
-      const data = await response.json();
+  // Add an empty assistant message placeholder that we will fill up
+  setChatHistory((prev) => [...prev, { role: "assistant", content: "" }]);
 
-      // 3. Add the AI's Socratic response to the screen
-      setChatHistory((prev) => [...prev, { role: "assistant", content: data.reply }]);
-    } catch (error) {
-      console.error("Connection to FastAPI failed:", error);
-      setChatHistory((prev) => [...prev, { role: "assistant", content: "I can't reach my brain right now. Is the backend running?" }]);
-    } finally {
-      setMessage("");
-      setIsLoading(false);
+  try {
+    const response = await fetch("http://localhost:8000/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: message, user_id: userId }),
+    });
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let accumulatedResponse = "";
+
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        accumulatedResponse += chunk;
+
+        // Update the LAST message in the history with the new text
+        setChatHistory((prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1].content = accumulatedResponse;
+          return updated;
+        });
+      }
     }
-  };
+  } catch (error) {
+    console.error("Streaming failed", error);
+  } finally {
+    setIsLoading(false);
+  }
+};
 
   return (
     <div className="w-full max-w-2xl mt-8 flex flex-col gap-4">

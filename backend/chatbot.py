@@ -3,6 +3,7 @@ import asyncio
 import json
 from openai import AsyncOpenAI, APIError, RateLimitError, APITimeoutError
 from dotenv import load_dotenv
+from fastapi.responses import StreamingResponse
 
 # Import your local modules
 from database import get_user_context, save_user_fact, get_all_user_facts
@@ -59,18 +60,22 @@ async def extract_and_save_facts(username, user_input):
     except:
         pass
 
-# --- THE MAIN BRAIN (WEB COMPATIBLE) ---
+# --- SHARED RAG CONTEXT BUILDER ---
 
-async def get_tutor_response_web(user_input: str, username: str) -> str:
+async def build_rag_context(user_input: str, username: str) -> tuple[list, str, str]:
     """
-    This is the function app.py calls. It handles the full RAG pipeline 
-    and returns a single string response.
+    Shared helper that runs the full RAG pipeline and returns
+    (messages, current_subject, user_input) — used by both the
+    streaming and non-streaming response functions.
     """
     # 1. Get Long Term Memory (SQL)
     long_term_memory = get_user_context(username)
-    
+
     # 2. Build personalized system message
-    system_message = {"role": "system", "content": f"{BASE_INSTRUCTIONS}\n\n[USER CONTEXT]\n{long_term_memory}"}
+    system_message = {
+        "role": "system",
+        "content": f"{BASE_INSTRUCTIONS}\n\n[USER CONTEXT]\n{long_term_memory}"
+    }
 
     # 3. Analyze Input
     analysis = await extract_keywords_and_subject(user_input)
@@ -80,27 +85,98 @@ async def get_tutor_response_web(user_input: str, username: str) -> str:
     # 4. Recall Past Episodes (Vector)
     hybrid_query = f"Keywords: {keywords}. Context: {user_input}"
     past_memories = recall_past_episodes(hybrid_query, username, current_subject)
-    
+
     # 5. Build the context injection
     messages = [system_message]
     if past_memories:
-        memory_context = f"\n[PAST LESSONS ON {current_subject.upper()}]\n" + "\n---\n".join(past_memories)
+        memory_context = (
+            f"\n[PAST LESSONS ON {current_subject.upper()}]\n"
+            + "\n---\n".join(past_memories)
+        )
         messages.append({"role": "system", "content": memory_context})
-    
+
     messages.append({"role": "user", "content": user_input})
 
-    # 6. Generate Response
+    return messages, current_subject, user_input
+
+
+# --- STREAMING RESPONSE (for web / FastAPI endpoints) ---
+
+async def get_tutor_stream(user_input: str, username: str):
+    """
+    Returns a StreamingResponse-compatible async generator.
+    Runs the full RAG pipeline, streams tokens to the frontend,
+    then persists the completed reply to memory in the background.
+
+    Usage in app.py:
+        return StreamingResponse(
+            await get_tutor_stream(user_input, username),
+            media_type="text/plain"
+        )
+    """
+    # Re-use the shared RAG context builder
+    messages, current_subject, _ = await build_rag_context(user_input, username)
+
+    # Open the streaming request
+    response = await client.chat.completions.create(
+        model="openrouter/auto",
+        extra_body={
+            "models": ["google/gemini-2.0-flash-exp:free", 
+                       "google/gemini-pro-1.5:free" 
+                       ],
+           
+        },
+        messages=messages,
+        max_tokens=800,
+        temperature=0.7,
+        stream=True,  # 👈 CRITICAL: enables streaming
+    )
+
+    async def stream_generator():
+        full_response = ""
+        async for chunk in response:
+            # Some chunks may have no delta content (e.g. the final stop chunk)
+            delta = chunk.choices[0].delta
+            content = delta.content
+            if content:
+                full_response += content
+                yield content  # 👈 Send each piece to the frontend immediately
+
+        # After the stream ends, persist to memory in the background
+        try:
+            save_episode(username, current_subject, user_input, full_response)
+            # This task is already async, which is good!
+            asyncio.create_task(extract_and_save_facts(username, user_input))
+        except Exception as e:
+            print(f"⚠️ Background Persistence Error: {e}")
+        
+    return stream_generator()
+
+
+# --- NON-STREAMING RESPONSE (kept for terminal / fallback use) ---
+
+async def get_tutor_response_web(user_input: str, username: str) -> str:
+    """
+    Returns a complete string response (non-streaming).
+    Calls the shared RAG builder so logic stays in sync with get_tutor_stream.
+    """
+    messages, current_subject, _ = await build_rag_context(user_input, username)
+
     try:
         response = await client.chat.completions.create(
             model="openrouter/free",
-            extra_body={"models": ["google/gemini-2.0-flash-exp:free"], "route": "fallback"},
+            extra_body={
+                "models": ["google/gemini-2.0-flash-exp:free"],
+                "route": "fallback"
+            },
             messages=messages,
             max_tokens=800,
             temperature=0.7,
         )
+
         tutor_reply = response.choices[0].message.content.strip()
 
-        # 7. Persistence (Save in background)
+        # Persistence
         save_episode(username, current_subject, user_input, tutor_reply)
         asyncio.create_task(extract_and_save_facts(username, user_input))
 
@@ -109,25 +185,33 @@ async def get_tutor_response_web(user_input: str, username: str) -> str:
     except Exception as e:
         return f"I'm sorry, I'm having trouble thinking right now. (Error: {str(e)})"
 
+
 # --- MANAGEMENT LOGIC ---
 
 async def handle_management_command(user_input, username):
     cmd_lower = user_input.lower()
-    
-    # Check for keywords instead of exact phrases
-    is_memory_req = "memory" in cmd_lower and ("show" in cmd_lower or "dashboard" in cmd_lower)
-    
+
+    is_memory_req = "memory" in cmd_lower and (
+        "show" in cmd_lower or "dashboard" in cmd_lower
+    )
+
     if is_memory_req:
         facts = get_all_user_facts(username)
         topics = get_recent_topics(username)
-        
+
         dashboard = f"### 🧠 Memory Dashboard: {username}\n\n"
         dashboard += "**Known Facts:**\n"
-        dashboard += "\n".join([f"- {f[0].title()}: {f[1]}" for f in facts]) if facts else "- None yet."
+        dashboard += (
+            "\n".join([f"- {f[0].title()}: {f[1]}" for f in facts])
+            if facts else "- None yet."
+        )
         dashboard += "\n\n**Recent Topics:**\n"
-        dashboard += f"- {', '.join([t.title() for t in topics])}" if topics else "- No history."
+        dashboard += (
+            f"- {', '.join([t.title() for t in topics])}"
+            if topics else "- No history."
+        )
         return dashboard
-    
+
     if any(phrase in cmd_lower for phrase in ["privacy", "policy"]):
         return get_privacy_policy()
 
@@ -137,26 +221,29 @@ async def handle_management_command(user_input, username):
 
     return None
 
+
 # --- TERMINAL ONLY LOGIC ---
 
 async def terminal_main():
     """Only runs if you execute 'python chatbot.py' directly."""
     print("--- Socratic Tutor (Terminal Mode) ---")
     user_nm = input("What is your name? ")
-    
+
     while True:
         u_input = input("\nYou: ")
-        if u_input.lower() == "exit": break
-        
-        # Check management
+        if u_input.lower() == "exit":
+            break
+
+        # Check management commands first
         m_resp = await handle_management_command(u_input, user_nm)
         if m_resp:
             print(f"\nTutor: {m_resp}")
             continue
-            
-        # Get normal response
+
+        # Use non-streaming path in terminal (streaming makes no sense here)
         resp = await get_tutor_response_web(u_input, user_nm)
         print(f"\nTutor: {resp}")
+
 
 if __name__ == "__main__":
     asyncio.run(terminal_main())

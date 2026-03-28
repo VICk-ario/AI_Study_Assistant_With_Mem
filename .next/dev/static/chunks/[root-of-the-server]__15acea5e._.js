@@ -20,17 +20,24 @@ function ChatInterface({ userId }) {
     const sendMessage = async ()=>{
         if (!message.trim()) return;
         setIsLoading(true);
-        // 1. Add your message to the screen immediately
-        const userMessage = {
+        const userMsg = {
             role: "user",
             content: message
         };
         setChatHistory((prev)=>[
                 ...prev,
-                userMessage
+                userMsg
+            ]);
+        setMessage("");
+        // Add an empty assistant message placeholder that we will fill up
+        setChatHistory((prev)=>[
+                ...prev,
+                {
+                    role: "assistant",
+                    content: ""
+                }
             ]);
         try {
-            // 2. Send the message to your FastAPI backend
             const response = await fetch("http://localhost:8000/chat", {
                 method: "POST",
                 headers: {
@@ -41,26 +48,30 @@ function ChatInterface({ userId }) {
                     user_id: userId
                 })
             });
-            const data = await response.json();
-            // 3. Add the AI's Socratic response to the screen
-            setChatHistory((prev)=>[
-                    ...prev,
-                    {
-                        role: "assistant",
-                        content: data.reply
-                    }
-                ]);
+            const reader = response.body?.getReader();
+            const decoder = new TextDecoder();
+            let accumulatedResponse = "";
+            if (reader) {
+                while(true){
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value, {
+                        stream: true
+                    });
+                    accumulatedResponse += chunk;
+                    // Update the LAST message in the history with the new text
+                    setChatHistory((prev)=>{
+                        const updated = [
+                            ...prev
+                        ];
+                        updated[updated.length - 1].content = accumulatedResponse;
+                        return updated;
+                    });
+                }
+            }
         } catch (error) {
-            console.error("Connection to FastAPI failed:", error);
-            setChatHistory((prev)=>[
-                    ...prev,
-                    {
-                        role: "assistant",
-                        content: "I can't reach my brain right now. Is the backend running?"
-                    }
-                ]);
+            console.error("Streaming failed", error);
         } finally{
-            setMessage("");
             setIsLoading(false);
         }
     };
@@ -75,7 +86,7 @@ function ChatInterface({ userId }) {
                         children: "Ask your tutor anything to begin..."
                     }, void 0, false, {
                         fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                        lineNumber: 47,
+                        lineNumber: 60,
                         columnNumber: 11
                     }, this),
                     chatHistory.map((msg, i)=>/*#__PURE__*/ (0, __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2f$dist$2f$compiled$2f$react$2f$jsx$2d$dev$2d$runtime$2e$js__$5b$app$2d$client$5d$__$28$ecmascript$29$__["jsxDEV"])("div", {
@@ -85,18 +96,18 @@ function ChatInterface({ userId }) {
                                 children: msg.content
                             }, void 0, false, {
                                 fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                                lineNumber: 58,
+                                lineNumber: 71,
                                 columnNumber: 13
                             }, this)
                         }, i, false, {
                             fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                            lineNumber: 50,
+                            lineNumber: 63,
                             columnNumber: 11
                         }, this))
                 ]
             }, void 0, true, {
                 fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                lineNumber: 45,
+                lineNumber: 58,
                 columnNumber: 7
             }, this),
             /*#__PURE__*/ (0, __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2f$dist$2f$compiled$2f$react$2f$jsx$2d$dev$2d$runtime$2e$js__$5b$app$2d$client$5d$__$28$ecmascript$29$__["jsxDEV"])("div", {
@@ -110,7 +121,7 @@ function ChatInterface({ userId }) {
                         onKeyDown: (e)=>e.key === 'Enter' && sendMessage()
                     }, void 0, false, {
                         fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                        lineNumber: 65,
+                        lineNumber: 78,
                         columnNumber: 9
                     }, this),
                     /*#__PURE__*/ (0, __TURBOPACK__imported__module__$5b$project$5d2f$node_modules$2f$next$2f$dist$2f$compiled$2f$react$2f$jsx$2d$dev$2d$runtime$2e$js__$5b$app$2d$client$5d$__$28$ecmascript$29$__["jsxDEV"])("button", {
@@ -120,19 +131,19 @@ function ChatInterface({ userId }) {
                         children: isLoading ? "..." : "Send"
                     }, void 0, false, {
                         fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                        lineNumber: 72,
+                        lineNumber: 85,
                         columnNumber: 9
                     }, this)
                 ]
             }, void 0, true, {
                 fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-                lineNumber: 64,
+                lineNumber: 77,
                 columnNumber: 7
             }, this)
         ]
     }, void 0, true, {
         fileName: "[project]/frontend/app/components/ChatInterface.tsx",
-        lineNumber: 43,
+        lineNumber: 56,
         columnNumber: 5
     }, this);
 }
